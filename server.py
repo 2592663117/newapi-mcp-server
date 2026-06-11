@@ -1,59 +1,95 @@
-"""NewAPI MCP Server - Streamable HTTP mode for Render deployment."""
+"""NewAPI MCP Server - 对接 NewAPI 生图模型 (gpt-image-2)
+支持 Streamable HTTP 模式，可部署到魔搭/Render
+"""
 
 import os
 import json
+import logging
 import httpx
-from fastmcp import FastMCP
-from dotenv import load_dotenv
+from mcp.server.fastmcp import FastMCP
 
-load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("newapi-mcp")
 
-NEWAPI_BASE_URL = os.getenv("NEWAPI_BASE_URL", "https://jiuuij.de5.net")
+NEWAPI_BASE_URL = os.getenv("NEWAPI_BASE_URL", "").rstrip("/")
 NEWAPI_API_KEY = os.getenv("NEWAPI_API_KEY", "")
 
-mcp = FastMCP("newapi-mcp-server")
+mcp = FastMCP("newapi-image")
 
 @mcp.tool()
 async def generate_image(prompt: str, size: str = "1024x1024") -> str:
-    """Generate image using NewAPI gpt-image-2 model."""
+    """调用 NewAPI 的 gpt-image-2 模型生成图片。
+    
+    Args:
+        prompt: 图片描述（英文效果更好）
+        size: 图片尺寸，可选 1024x1024 / 1536x1024 / 1024x1536
+    
+    Returns:
+        生成结果：base64 数据或图片 URL
+    """
+    if not NEWAPI_BASE_URL:
+        return "❌ 错误: 未设置 NEWAPI_BASE_URL 环境变量"
     if not NEWAPI_API_KEY:
-        return "Error: NEWAPI_API_KEY not configured"
+        return "❌ 错误: 未设置 NEWAPI_API_KEY 环境变量"
     
     headers = {
         "Authorization": f"Bearer {NEWAPI_API_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
     payload = {
         "model": "gpt-image-2",
         "prompt": prompt,
         "size": size,
         "n": 1,
-        "response_format": "b64_json"
+        "response_format": "url",
     }
     
+    logger.info(f"🎨 生成图片: {prompt[:50]}... 尺寸:{size}")
+    
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            resp = await client.post(
                 f"{NEWAPI_BASE_URL}/v1/images/generations",
                 headers=headers,
-                json=payload
+                json=payload,
             )
-            response.raise_for_status()
-            data = response.json()
+            resp.raise_for_status()
+            data = resp.json()
             
-            if "data" in data and len(data["data"]) > 0:
-                image_data = data["data"][0]
-                if "b64_json" in image_data:
-                    return f"Image generated successfully (base64, {len(image_data['b64_json'])} chars)"
-                elif "url" in image_data:
-                    return f"Image URL: {image_data['url']}"
-            return f"Response: {json.dumps(data)}"
+            if data.get("data") and len(data["data"]) > 0:
+                img = data["data"][0]
+                if "url" in img:
+                    logger.info(f"✅ 图片生成成功! URL: {img['url'][:80]}...")
+                    return json.dumps({"success": True, "url": img["url"]}, ensure_ascii=False)
+                elif "b64_json" in img:
+                    return json.dumps({"success": True, "format": "base64", "size": len(img["b64_json"])})
+            return f"⚠️ 返回异常: {json.dumps(data)}"
+            
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP错误: {e.response.status_code} - {e.response.text}")
+        return f"❌ API错误 ({e.response.status_code}): {e.response.text[:200]}"
     except Exception as e:
-        return f"Error: {str(e)}"
+        logger.error(f"异常: {e}")
+        return f"❌ 请求失败: {str(e)}"
 
-@mcp.resource("newapi://status")
-def get_status() -> str:
-    return json.dumps({"server": "newapi-mcp-server", "version": "0.1.0"}, indent=2)
+@mcp.tool()
+async def list_models() -> str:
+    """列出 NewAPI 可用模型（验证连接）"""
+    if not NEWAPI_BASE_URL or not NEWAPI_API_KEY:
+        return "❌ 未配置环境变量"
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                f"{NEWAPI_BASE_URL}/v1/models",
+                headers={"Authorization": f"Bearer {NEWAPI_API_KEY}"},
+            )
+            models = resp.json().get("data", [])
+            names = [m.get("id", "") for m in models if "image" in m.get("id", "").lower()]
+            return json.dumps({"connected": True, "image_models": names}, ensure_ascii=False)
+    except Exception as e:
+        return f"❌ 连接失败: {str(e)}"
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    port = int(os.getenv("PORT", os.getenv("MCP_PORT", "8000")))
+    logger.info(f"🚀 启动 NewAPI MCP Server (端口: {port})")
+    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
